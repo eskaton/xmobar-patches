@@ -1,0 +1,357 @@
+diff -rupN xmobar/src/Action.hs xmobar-patched/src/Action.hs
+--- xmobar/src/Action.hs	1970-01-01 01:00:00.000000000 +0100
++++ xmobar-patched/src/Action.hs	2013-03-19 19:02:40.000000000 +0100
+@@ -0,0 +1,16 @@
++{-# LANGUAGE ExistentialQuantification #-}
++module Action (
++     Action(..)
++   , ExecAction(..)
++   ) where
++
++data Action = forall a . (ExecAction a) => Act a
++
++--instance Show Action where
++--   show (Act a) = show a
++
++class ExecAction a where
++   execute :: a -> IO ()
++
++instance ExecAction Action where
++   execute (Act a) = execute a
+diff -rupN xmobar/src/Parsers.hs xmobar-patched/src/Parsers.hs
+--- xmobar/src/Parsers.hs	2013-03-19 18:59:28.000000000 +0100
++++ xmobar-patched/src/Parsers.hs	2013-03-19 19:02:03.000000000 +0100
+@@ -19,32 +19,36 @@ module Parsers
+     , parseConfig
+     ) where
+ 
++import Action
++import SwitchWS
+ import Config
+ import Runnable
+ import Commands
++import Settings
+ 
+ import qualified Data.Map as Map
+ import Text.ParserCombinators.Parsec
+ import Text.ParserCombinators.Parsec.Perm
++import Text.ParserCombinators.Parsec.Error
+ 
+ -- | Runs the string parser
+-parseString :: Config -> String -> IO [(String, String)]
++parseString :: Config -> String -> IO [(String, Settings)]
+ parseString c s =
+-    case parse (stringParser (fgColor c)) "" s of
+-      Left  _ -> return [("Could not parse string: " ++ s, fgColor c)]
++    case parse (stringParser emptySettings {seFc = Just $ fgColor c}) "" s of
++      Left  _ -> return [("Could not parse string: " ++ s, emptySettings {seFc = Just $ fgColor c})]
+       Right x -> return (concat x)
+ 
+ -- | Gets the string and combines the needed parsers
+-stringParser :: String -> Parser [[(String, String)]]
+-stringParser c = manyTill (textParser c <|> colorParser) eof
++stringParser :: Settings -> Parser [[(String, Settings)]]
++stringParser se = manyTill (textParser se <|> tagParser se) eof
+ 
+ -- | Parses a maximal string without color markup.
+-textParser :: String -> Parser [(String, String)]
+-textParser c = do s <- many1 $
+-                    noneOf "<" <|>
+-                    ( try $ notFollowedBy' (char '<')
+-                                           (string "fc=" <|> string "/fc>" ) )
+-                  return [(s, c)]
++textParser :: Settings -> Parser [(String, Settings)]
++textParser se = do s <- many1 $
++                     noneOf "<" <|>
++                     ( try $ notFollowedBy' (char '<')
++                                            (string "action=" <|> string "fc=" <|> (char '/' >> (string "action>" <|> string "fc>"))))
++                   return [(s, se)]
+ 
+ -- | Wrapper for notFollowedBy that returns the result of the first parser.
+ --   Also works around the issue that, at least in Parsec 3.0.0, notFollowedBy
+@@ -54,13 +58,41 @@ notFollowedBy' p e = do x <- p
+                         notFollowedBy $ try (e >> return '*')
+                         return x
+ 
++tagParser :: Settings -> Parser [(String, Settings)]
++tagParser se = char '<' >> (colorParser se <|> actionParser se)
++
+ -- | Parsers a string wrapped in a color specification.
+-colorParser :: Parser [(String, String)]
+-colorParser = do
+-  c <- between (string "<fc=") (string ">") colors
+-  s <- manyTill (textParser c <|> colorParser) (try $ string "</fc>")
++colorParser :: Settings -> Parser [(String, Settings)]
++colorParser se = do
++  c <- between (string "fc=") (string ">") colors
++  s <- manyTill (textParser (se {seFc = Just c})  <|> tagParser (se {seFc = Just c})) (try $ string "</fc>")
++  return (concat s)
++
++actionParser :: Settings -> Parser [(String, Settings)]
++actionParser se = do
++  a <- between (string "action=") (string ">") actions
++  s <- manyTill (textParser se {seAction = Just a} <|> tagParser se {seAction = Just a}) (try $ string "</action>")
+   return (concat s)
+ 
++actions :: Parser Action
++actions = do
++      act <- many1 (alphaNum <|> char ',' <|> char ':')
++      return (action act)
++   where
++      action :: String -> Action
++      action a = 
++            case split a ':' of
++               ("ws":[arg]) -> Act $ SwitchWS $ (read arg :: Int)
++
++-- split String at each Char
++split :: String -> Char -> [String]
++split [] _ = [""]
++split (c:cs) delim
++    | c == delim = "" : rest
++    | otherwise = (c : head rest) : tail rest
++        where
++            rest = split cs delim
++
+ -- | Parses a color specification (hex or named)
+ colors :: Parser String
+ colors = many1 (alphaNum <|> char ',' <|> char '#')
+diff -rupN xmobar/src/Settings.hs xmobar-patched/src/Settings.hs
+--- xmobar/src/Settings.hs	1970-01-01 01:00:00.000000000 +0100
++++ xmobar-patched/src/Settings.hs	2013-03-19 19:02:49.000000000 +0100
+@@ -0,0 +1,11 @@
++module Settings where
++
++import Action
++
++data Settings = S {
++        seFc :: Maybe String
++      , seAction :: Maybe Action
++      } --deriving (Show)
++
++emptySettings :: Settings
++emptySettings = S {seFc = Nothing, seAction = Nothing}
+diff -rupN xmobar/src/SwitchWS.hs xmobar-patched/src/SwitchWS.hs
+--- xmobar/src/SwitchWS.hs	1970-01-01 01:00:00.000000000 +0100
++++ xmobar-patched/src/SwitchWS.hs	2013-03-19 19:02:54.000000000 +0100
+@@ -0,0 +1,24 @@
++module SwitchWS where
++
++import Action
++--import Xmobar
++import Graphics.X11.Xlib
++import Graphics.X11.Xlib.Extras
++
++data SwitchWS = SwitchWS Int
++   deriving (Show)
++
++instance ExecAction SwitchWS where
++   execute (SwitchWS ws) = sendSwitchWorkspace ws
++
++sendSwitchWorkspace :: Int -> IO ()
++sendSwitchWorkspace ws = do
++    dpy <- openDisplay ""
++    rw <- rootWindow dpy $ defaultScreen dpy 
++    curDesk <- internAtom dpy "_NET_CURRENT_DESKTOP" False
++    allocaXEvent $ \e -> do
++        setEventType e clientMessage
++        setClientMessageEvent e rw curDesk 32 (fromIntegral ws) currentTime
++        sendEvent dpy rw False structureNotifyMask e
++    sync dpy False
++    closeDisplay dpy
+diff -rupN xmobar/src/Xmobar.hs xmobar-patched/src/Xmobar.hs
+--- xmobar/src/Xmobar.hs	2013-03-19 18:59:28.000000000 +0100
++++ xmobar-patched/src/Xmobar.hs	2013-03-19 19:04:31.000000000 +0100
+@@ -42,11 +42,13 @@ import Control.Concurrent.STM
+ import Control.Exception (handle, SomeException(..))
+ import Data.Bits
+ 
++import Action
+ import Config
+ import Parsers
+ import Commands
+ import Runnable
+ import Signal
++import Settings
+ import Window
+ import XUtil
+ import ColorCache
+@@ -86,25 +88,26 @@ startLoop xcfg@(XConf _ _ w _ _) sig vs 
+     xftInitFtLibrary
+ #endif
+     tv <- atomically $ newTVar []
++    tvAct <- atomically $ newTVar []
+     _ <- forkIO (handle (handler "checker") (checker tv [] vs sig))
+ #ifdef THREADED_RUNTIME
+-    _ <- forkOS (handle (handler "eventer") (eventer sig))
++    _ <- forkOS (handle (handler "eventer") (eventer sig tvAct))
+ #else
+-    _ <- forkIO (handle (handler "eventer") (eventer sig))
++    _ <- forkIO (handle (handler "eventer") (eventer sig tvAct))
+ #endif
+ #ifdef DBUS
+     runIPC sig
+ #endif
+-    eventLoop tv xcfg sig
++    eventLoop tv tvAct xcfg sig
+   where
+     handler thing (SomeException _) =
+       putStrLn ("Thread " ++ thing ++ " failed") >> return ()
+     -- Reacts on events from X
+-    eventer signal =
++    eventer signal tvAct =
+       allocaXEvent $ \e -> do
+         dpy <- openDisplay ""
+         xrrSelectInput    dpy (defaultRootWindow dpy) rrScreenChangeNotifyMask
+-        selectInput       dpy w (exposureMask .|. structureNotifyMask)
++        selectInput       dpy w (exposureMask .|. structureNotifyMask .|. buttonPressMask)
+ 
+         forever $ do
+ #ifdef THREADED_RUNTIME
+@@ -117,6 +120,12 @@ startLoop xcfg@(XConf _ _ w _ _) sig vs 
+             ConfigureEvent {} -> atomically $ putTMVar signal Reposition
+             ExposeEvent {} -> atomically $ putTMVar signal Wakeup
+             RRScreenChangeNotifyEvent {} -> atomically $ putTMVar signal Reposition
++            ButtonEvent {ev_x = x} -> do
++               acts <- io $ atomically $ readTVar tvAct
++               case filter (\(x1, x2, _) -> fi x1 <= x && x <= fi x2) acts of
++                  [(_,_,act)] -> do 
++                     execute act
++                  _           -> return ()
+             _ -> return ()
+ 
+ -- | Send signal to eventLoop every time a var is updated
+@@ -138,13 +147,13 @@ checker tvar ov vs signal = do
+ 
+ 
+ -- | Continuously wait for a signal from a thread or a interrupt handler
+-eventLoop :: TVar [String] -> XConf -> TMVar SignalType -> IO ()
+-eventLoop tv xc@(XConf d r w fs cfg) signal = do
++eventLoop :: TVar [String] -> TVar [(Position, Position, Action)]-> XConf -> TMVar SignalType -> IO ()
++eventLoop tv tvAct xc@(XConf d r w fs cfg) signal = do
+       typ <- atomically $ takeTMVar signal
+       case typ of
+          Wakeup -> do
+-            runX xc (updateWin tv)
+-            eventLoop tv xc signal
++            runX xc (updateWin tv tvAct)
++            eventLoop tv tvAct xc signal
+ 
+          Reposition ->
+             reposWindow cfg
+@@ -158,36 +167,36 @@ eventLoop tv xc@(XConf d r w fs cfg) sig
+          Toggle t -> toggle t
+ 
+          TogglePersistent -> eventLoop
+-            tv xc { config = cfg { persistent = not $ persistent cfg } } signal
++            tv tvAct xc { config = cfg { persistent = not $ persistent cfg } } signal
+ 
+     where
+         isPersistent = not $ persistent cfg
+ 
+         hide t
+             | t == 0 =
+-                when isPersistent (hideWindow d w) >> eventLoop tv xc signal
++                when isPersistent (hideWindow d w) >> eventLoop tv tvAct xc signal
+             | otherwise = do
+                 void $ forkIO
+                      $ threadDelay t >> atomically (putTMVar signal $ Hide 0)
+-                eventLoop tv xc signal
++                eventLoop tv tvAct xc signal
+ 
+         reveal t
+             | t == 0 = do
+                 when isPersistent (showWindow r cfg d w)
+-                eventLoop tv xc signal
++                eventLoop tv tvAct xc signal
+             | otherwise = do
+                 void $ forkIO
+                      $ threadDelay t >> atomically (putTMVar signal $ Reveal 0)
+-                eventLoop tv xc signal
++                eventLoop tv tvAct xc signal
+ 
+         toggle t = do
+             ismapped <- isMapped d w
+             atomically (putTMVar signal $ if ismapped then Hide t else Reveal t)
+-            eventLoop tv xc signal
++            eventLoop tv tvAct xc signal
+ 
+         reposWindow rcfg = do
+           r' <- repositionWin d w fs rcfg
+-          eventLoop tv (XConf d r' w fs rcfg) signal
++          eventLoop tv tvAct (XConf d r' w fs rcfg) signal
+ 
+         updateConfigPosition ocfg =
+           case position ocfg of
+@@ -219,24 +228,24 @@ startCommand sig (com,s,ss)
+                            return (Just h,var)
+     where is = s ++ "Updating..." ++ ss
+ 
+-updateWin :: TVar [String] -> X ()
+-updateWin v = do
++updateWin :: TVar [String] -> TVar [(Position, Position, Action)] -> X ()
++updateWin v tvAct = do
+   xc <- ask
+   s <- io $ atomically $ readTVar v
+   let (conf,rec) = (config &&& rect) xc
+       l:c:r:_ = s ++ repeat ""
+   ps <- io $ mapM (parseString conf) [l, c, r]
+-  drawInWin rec ps
++  drawInWin rec ps tvAct
+ 
+ -- $print
+ 
+ -- | Draws in and updates the window
+-drawInWin :: Rectangle -> [[(String, String)]] -> X ()
+-drawInWin (Rectangle _ _ wid ht) ~[left,center,right] = do
++drawInWin :: Rectangle -> [[(String, Settings)]] -> TVar [(Position, Position, Action)] -> X ()
++drawInWin (Rectangle _ _ wid ht) ~[left,center,right] tvAct = do
+   r <- ask
+   let (c,d ) = (config &&& display) r
+       (w,fs) = (window &&& fontS  ) r
+-      strLn  = io . mapM (\(s,cl) -> textWidth d fs s >>= \tw -> return (s,cl,fi tw))
++      strLn  = io . mapM (\(s,se) -> textWidth d fs s >>= \tw -> return (s,se,fi tw))
+   withColors d [bgColor c, borderColor c] $ \[bgcolor, bdcolor] -> do
+     gc <- io $ createGC  d w
+     -- create a pixmap to write to and fill it with a rectangle
+@@ -246,9 +255,10 @@ drawInWin (Rectangle _ _ wid ht) ~[left,
+     io $ setForeground d gc bgcolor
+     io $ fillRectangle d p gc 0 0 wid ht
+     -- write to the pixmap the new string
+-    printStrings p gc fs 1 L =<< strLn left
+-    printStrings p gc fs 1 R =<< strLn right
+-    printStrings p gc fs 1 C =<< strLn center
++    acts   <- printStrings p gc fs 1 L [] =<< strLn left
++    acts'  <- printStrings p gc fs 1 R acts =<< strLn right
++    acts'' <- printStrings p gc fs 1 C acts' =<< strLn center
++    io $ atomically $ writeTVar tvAct acts'' 
+     -- draw 1 pixel border if requested
+     io $ drawBorder (border c) d p gc bdcolor wid ht
+     -- copy the pixmap with the new string to the window
+@@ -261,9 +271,9 @@ drawInWin (Rectangle _ _ wid ht) ~[left,
+ 
+ -- | An easy way to print the stuff we need to print
+ printStrings :: Drawable -> GC -> XFont -> Position
+-             -> Align -> [(String, String, Position)] -> X ()
+-printStrings _ _ _ _ _ [] = return ()
+-printStrings dr gc fontst offs a sl@((s,c,l):xs) = do
++             -> Align -> [(Position, Position, Action)] -> [(String, Settings, Position)] -> X [(Position, Position, Action)]
++printStrings _ _ _ _ _ acts [] = return acts
++printStrings dr gc fontst offs a acts sl@((s,se,l):xs) = do
+   r <- ask
+   (as,ds) <- io $ textExtents fontst s
+   let (conf,d)             = (config &&& display) r
+@@ -275,8 +285,12 @@ printStrings dr gc fontst offs a sl@((s,
+                                C -> (remWidth + offs) `div` 2
+                                R -> remWidth
+                                L -> offs
+-      (fc,bc)              = case break (==',') c of
++      (fc,bc)              = case break (==',') (maybe (fgColor conf) id (seFc se)) of
+                                (f,',':b) -> (f, b           )
+                                (f,    _) -> (f, bgColor conf)
++  let acts' = case seAction se of
++               Just act -> do
++                  (offset, offset+l, act):acts
++               _        -> acts
+   io $ printString d dr fontst gc fc bc offset valign s
+-  printStrings dr gc fontst (offs + l) a xs
++  printStrings dr gc fontst (offs + l) a acts' xs

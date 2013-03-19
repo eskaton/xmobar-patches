@@ -1,0 +1,26 @@
+diff -rupN xmobar/src/Plugins/Monitors/Disk.hs xmobar-patched/src/Plugins/Monitors/Disk.hs
+--- xmobar/src/Plugins/Monitors/Disk.hs	2013-03-19 18:55:24.000000000 +0100
++++ xmobar-patched/src/Plugins/Monitors/Disk.hs	2013-03-19 19:15:15.000000000 +0100
+@@ -39,7 +39,7 @@ type DevDataRef = IORef [(DevName, [Floa
+ 
+ mountedDevices :: [String] -> IO [(DevName, Path)]
+ mountedDevices req = do
+-  s <- B.readFile "/etc/mtab"
++  s <- B.readFile "/compat/linux/proc/mtab"
+   parse `fmap` mapM canon (devs s)
+   where
+     canon (d, p) = do {d' <- canonicalizePath d; return (d', p)}
+diff -rupN xmobar/src/Plugins/Monitors/Mem.hs xmobar-patched/src/Plugins/Monitors/Mem.hs
+--- xmobar/src/Plugins/Monitors/Mem.hs	2013-03-19 18:59:28.000000000 +0100
++++ xmobar-patched/src/Plugins/Monitors/Mem.hs	2013-03-19 19:15:27.000000000 +0100
+@@ -28,8 +28,8 @@ fileMEM = readFile "/proc/meminfo"
+ parseMEM :: IO [Float]
+ parseMEM =
+     do file <- fileMEM
+-       let content = map words $ take 4 $ lines file
+-           [total, free, buffer, cache] = map (\line -> (read $ line !! 1 :: Float) / 1024) content
++       let content = map words $ take 5 $ drop 3 $ lines file
++           [total, free, shared, buffer, cache] = map (\line -> (read $ line !! 1 :: Float) / 1024) content
+            rest = free + buffer + cache
+            used = total - rest
+            usedratio = used / total
